@@ -6,6 +6,7 @@
 """Helper functions."""
 
 from .log_writer import LogWriter
+from .motion_loader import AMPLoader, compute_amp_features
 from .neptune_log_writer import NeptuneLogWriter
 from .utils import (
     check_nan,
@@ -23,11 +24,13 @@ from .utils import (
 from .wandb_log_writer import WandbLogWriter
 
 __all__ = [
+    "AMPLoader",
     "LogWriter",
     "NeptuneLogWriter",
     "WandbLogWriter",
     "check_nan",
     "compile_model",
+    "compute_amp_features",
     "get_param",
     "reduce_gradients_in_buckets",
     "resolve_callable",

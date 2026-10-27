@@ -1,5 +1,8 @@
 # RSL-RL
 
+This fork maintains an [AMP extension](docs/AMP.md) against the current upstream interfaces.
+The Python package remains `rsl_rl` for compatibility with consuming simulation projects.
+
 **RSL-RL** is a GPU-accelerated, lightweight learning library for robotics research. Its compact design allows
 researchers to prototype and test new ideas without the overhead of modifying large, complex libraries. RSL-RL can also
 be used out-of-the-box by installing it via [PyPI](https://pypi.org/project/rsl-rl-lib/), supports multi-GPU training,
