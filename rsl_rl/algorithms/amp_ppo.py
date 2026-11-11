@@ -49,9 +49,11 @@ class AMPPPO(PPO):
         amp_num_updates: int = 20,
         amp_batch_size: int = 512,
         amp_max_grad_norm: float | None = None,
-        amp_motion_files: str = "",
+        amp_motion_files: str | list[str] = "",
+        amp_motion_weights: dict[str, float] | None = None,
         amp_body_names: tuple[str, ...] = (),
         amp_anchor_name: str = "",
+        amp_root_name: str = "",
         amp_all_body_names: tuple[str, ...] = (),
         amp_frame_dt: float | None = None,
         amp_data: AMPData | None = None,
@@ -101,10 +103,13 @@ class AMPPPO(PPO):
         if amp_grad_penalty < 0:
             raise ValueError("amp_grad_penalty must be nonnegative")
         self.amp_data: AMPData | None = amp_data
+        self.amp_root_name = amp_root_name
         self._amp_motion_config: dict[str, Any] = dict(
             motion_file=amp_motion_files,
+            motion_weights=amp_motion_weights,
             body_names=amp_body_names,
             anchor_name=amp_anchor_name,
+            root_name=amp_root_name,
             all_body_names=amp_all_body_names,
             device=self.device,
             frame_dt=amp_frame_dt,
@@ -256,6 +261,7 @@ class AMPPPO(PPO):
             "amp_normalizer_state_dict": self.amp_normalizer.state_dict(),
             "amp_optimizer_state_dict": self.amp_optimizer.state_dict(),
             "amp_observation_dim": self.amp_observation_dim,
+            "amp_root_name": self.amp_root_name,
             # Audit metadata: cadence, clipping, and schedule are selected by the current run config.
             "amp_training_config": {
                 "amp_learning_rate": self.amp_optimizer.param_groups[0]["lr"],
@@ -273,6 +279,8 @@ class AMPPPO(PPO):
                 raise ValueError(
                     "Full AMP resume requires a matching AMP checkpoint; use actor-only loading for inference"
                 )
+            if loaded_dict.get("amp_root_name", "") != self.amp_root_name:
+                raise ValueError("Full AMP resume requires a matching amp_root_name and ground-state feature layout")
             self.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"], strict=strict)
             self.amp_normalizer.load_state_dict(loaded_dict["amp_normalizer_state_dict"], strict=strict)
             if load_cfg is None or load_cfg.get("optimizer", False):

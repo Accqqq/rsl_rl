@@ -175,6 +175,88 @@ def test_raw_motion_features_use_anchor_positions_and_body_local_velocities(tmp_
     assert torch.equal(state, expected)
 
 
+def test_optional_ground_features_append_clean_gravity_and_root_height() -> None:
+    """A 90-degree pitch retains the original fields and adds ground-relative information."""
+    half = 2**-0.5
+    positions = torch.tensor([[[0.0, 0.0, 0.8], [0.0, 0.0, 1.0]]] * 2)
+    rotations = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [half, 0.0, half, 0.0]]] * 2)
+    velocity = torch.zeros_like(positions)
+    original = compute_amp_features(positions, rotations, velocity, velocity, [0, 1], 1)
+    grounded = compute_amp_features(
+        positions, rotations, velocity, velocity, [0, 1], 1, root_index=0, ground_height=torch.tensor([0.1, 0.3])
+    )
+    assert grounded.shape == (2, 34)
+    assert torch.equal(grounded[:, :30], original)
+    torch.testing.assert_close(grounded[:, 30:33], torch.tensor([[1.0, 0.0, 0.0]] * 2), atol=1e-6, rtol=0)
+    torch.testing.assert_close(grounded[:, -1], torch.tensor([0.7, 0.5]))
+    scalar = compute_amp_features(positions, rotations, velocity, velocity, [0, 1], 1, root_index=0, ground_height=0.1)
+    torch.testing.assert_close(scalar[0], grounded[0])
+    with pytest.raises(ValueError, match="root_index"):
+        compute_amp_features(positions, rotations, velocity, velocity, [0, 1], 1, root_index=2)
+    for invalid_ground in (torch.zeros(2, 1), torch.zeros(3)):
+        with pytest.raises(ValueError, match="ground_height"):
+            compute_amp_features(
+                positions, rotations, velocity, velocity, [0, 1], 1, root_index=0, ground_height=invalid_ground
+            )
+
+
+def test_grounded_loader_resolves_root_by_name_and_rejects_ambiguous_schema(tmp_path: Path) -> None:
+    """The root may differ from the torso anchor and appear after it in the archive."""
+    path = tmp_path / "raw.npz"
+    position = np.zeros((3, 2, 3), np.float32)
+    position[:, :, 2] = [1.0, 0.7]
+    quaternion = np.zeros((3, 2, 4), np.float32)
+    quaternion[..., 0] = 1
+    arrays = dict(
+        fps=50,
+        body_names=["torso", "pelvis"],
+        body_pos_w=position,
+        body_quat_w=quaternion,
+        body_lin_vel_w=np.zeros_like(position),
+        body_ang_vel_w=np.zeros_like(position),
+    )
+    np.savez(path, **arrays)
+    loader = AMPLoader(path, ["torso"], "torso", root_name="pelvis")
+    assert loader.observation_dim == 19
+    state, _ = loader.sample(4)
+    torch.testing.assert_close(state[:, -4:], torch.tensor([[0.0, 0.0, -1.0, 0.7]] * 4))
+    with pytest.raises(ValueError, match="root_name"):
+        AMPLoader(path, ["torso"], "torso", root_name="missing")
+    arrays["body_names"] = ["torso", "torso"]
+    np.savez(path, **arrays)
+    with pytest.raises(ValueError, match="exactly one body"):
+        AMPLoader(path, ["torso"], "torso", root_name="torso")
+    np.savez(path, fps=50, amp_observations=np.zeros((3, 199)))
+    with pytest.raises(ValueError, match="raw body poses"):
+        AMPLoader(path, root_name="pelvis")
+
+
+def test_amp_root_config_forwarding_and_checkpoint_compatibility() -> None:
+    """Reject equal-size but differently grounded checkpoints before touching learned state."""
+    cfg = {"algorithm": {"amp_root_name": "pelvis"}, "amp_root_name": "other"}
+    assert prepare_amp_config(cfg)["algorithm"]["amp_root_name"] == "pelvis"
+    assert prepare_amp_config({"algorithm": {}, "amp_root_name": "pelvis"})["algorithm"]["amp_root_name"] == "pelvis"
+    source, _ = build_amp(amp_root_name="pelvis")
+    assert source._amp_motion_config["root_name"] == "pelvis"
+    state = deepcopy(source.save())
+    assert state["amp_root_name"] == "pelvis"
+    target, _ = build_amp(amp_root_name="pelvis")
+    assert target.load(state)
+    wrong = deepcopy(state)
+    wrong["amp_root_name"] = "torso"
+    before = deepcopy(target.save())
+    with pytest.raises(ValueError, match="amp_root_name"):
+        target.load(wrong)
+    for group in ("actor_state_dict", "critic_state_dict", "discriminator_state_dict", "amp_normalizer_state_dict"):
+        for key, value in before[group].items():
+            torch.testing.assert_close(target.save()[group][key], value)
+    # Pre-extension walking checkpoints have no root metadata and still resume.
+    walking, _ = build_amp()
+    walking_state = deepcopy(walking.save())
+    walking_state.pop("amp_root_name")
+    assert walking.load(walking_state)
+
+
 def test_legacy_amp_parameters_are_translated_without_mutating_input() -> None:
     """Keep the user-facing AMP configuration while using the new algorithm API."""
     cfg = {"algorithm": {"class_name": "AMPPPO"}, "amp_reward_coef": 0.1, "min_normalized_std": [0.05]}
@@ -350,3 +432,92 @@ def test_independent_amp_settings_are_forwarded_with_algorithm_precedence() -> N
     assert transformed["algorithm"]["amp_batch_size"] == 9
     assert transformed["algorithm"]["amp_max_grad_norm"] is None
     assert "amp_batch_size" not in transformed
+
+
+def test_loader_explicit_weights_preserve_group_share_and_clip_local_stride(tmp_path: Path) -> None:
+    """More get-up files cannot dilute a declared 50% quiet-reference share."""
+    weights = {"a.npz": 0.25, "b.npz": 0.25, "quiet.npz": 0.5}
+    for index, (name, length) in enumerate(zip(weights, (17, 93, 9))):
+        np.savez(tmp_path / name, fps=[50], amp_observations=100 * index + np.arange(length)[:, None])
+    loader = AMPLoader(tmp_path, frame_dt=0.04, motion_weights=weights)
+    torch.manual_seed(421)
+    before, after = loader.sample(12000)
+    assert torch.equal(after, before + 2)
+    shares = torch.bincount((before[:, 0] / 100).long(), minlength=3) / len(before)
+    torch.testing.assert_close(shares, torch.tensor([0.25, 0.25, 0.5]), atol=0.015, rtol=0)
+    # The default remains uniform by FILE, even when clip lengths differ.
+    uniform = AMPLoader(tmp_path)
+    torch.testing.assert_close(uniform.motion_probabilities, torch.full((3,), 1 / 3))
+    cfg = {"algorithm": {}, "amp_motion_weights": weights}
+    converted = prepare_amp_config(cfg)
+    assert converted["algorithm"]["amp_motion_weights"] == weights
+    assert "amp_motion_weights" in cfg and "amp_motion_weights" not in converted
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [
+        {"a.npz": 1},
+        {"a.npz": 1, "b.npz": 1, "extra.npz": 1},
+        {"a.npz": -1, "b.npz": 2},
+        {"a.npz": float("nan"), "b.npz": 1},
+        {"a.npz": 0, "b.npz": 0},
+        {"a.npz": float("inf"), "b.npz": 1},
+    ],
+)
+def test_loader_rejects_incomplete_or_invalid_motion_weights(tmp_path: Path, weights: dict) -> None:
+    """Reject incomplete path coverage and invalid sampling probabilities."""
+    for name in ("a.npz", "b.npz"):
+        np.savez(tmp_path / name, fps=[50], amp_observations=np.zeros((5, 3)))
+    with pytest.raises(ValueError, match="motion_weights"):
+        AMPLoader(tmp_path, motion_weights=weights)
+
+
+def test_loader_weights_use_relative_paths_and_allow_disabled_clip(tmp_path: Path) -> None:
+    """Disambiguate repeated stems and honor an explicit zero clip weight."""
+    (tmp_path / "nested").mkdir()
+    np.savez(tmp_path / "a.npz", fps=[50], amp_observations=np.zeros((5, 3)))
+    np.savez(tmp_path / "nested/a.npz", fps=[50], amp_observations=np.ones((5, 3)))
+    loader = AMPLoader(tmp_path, motion_weights={"a.npz": 0, "nested/a.npz": 1})
+    before, after = loader.sample(128)
+    assert before.eq(1).all() and after.eq(1).all()
+
+
+def test_explicit_files_mix_roots_without_reading_unselected_archives(tmp_path: Path) -> None:
+    """Mix a full old reference with selected additions, keeping exact pair weights."""
+    legacy = tmp_path / "legacy.npz"
+    extra = tmp_path / "additions"
+    extra.mkdir()
+    getup = extra / "getup.npz"
+    for path, offset, length in ((legacy, 0, 17), (getup, 100, 83), (extra / "quiet.npz", 200, 9)):
+        np.savez(path, fps=[50], amp_observations=(offset + np.arange(length, dtype=np.float32))[:, None])
+    paths = [str(legacy), str(getup)]
+    weights = {"legacy.npz": 0.8, "getup.npz": 0.2}
+    loader = AMPLoader(paths, frame_dt=0.04, motion_weights=weights)
+    assert loader.motion_names == ["legacy", "getup"]
+    assert [len(c) for c in loader.clips] == [17, 83]
+    torch.manual_seed(822)
+    state, following = loader.sample(20000)
+    assert torch.equal(following, state + 2)
+    assert (state < 200).all()
+    assert float((state >= 100).float().mean()) == pytest.approx(0.2, abs=0.012)
+    converted = prepare_amp_config({"algorithm": {}, "amp_motion_files": paths, "amp_motion_weights": weights})
+    assert converted["algorithm"]["amp_motion_files"] == paths
+    assert converted["algorithm"]["amp_motion_weights"] == weights
+    with pytest.raises(ValueError, match="exactly cover"):
+        AMPLoader(paths, motion_weights={"legacy.npz": 1})
+    with pytest.raises(FileNotFoundError, match="motion archives"):
+        AMPLoader([legacy, extra / "missing.npz"])
+
+
+def test_explicit_file_list_rejects_empty_and_duplicate_names(tmp_path: Path) -> None:
+    """Do not silently duplicate references or make filename weights ambiguous."""
+    with pytest.raises(ValueError, match="nonempty"):
+        AMPLoader([])
+    (tmp_path / "nested").mkdir()
+    for path in (tmp_path / "same.npz", tmp_path / "nested/same.npz"):
+        np.savez(path, fps=[50], amp_observations=np.zeros((5, 3)))
+    with pytest.raises(ValueError, match="unique file names"):
+        AMPLoader([tmp_path / "same.npz", tmp_path / "nested/same.npz"])
+    with pytest.raises(ValueError, match="unique file names"):
+        AMPLoader([tmp_path / "same.npz", tmp_path / "same.npz"])

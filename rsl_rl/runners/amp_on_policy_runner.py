@@ -19,6 +19,7 @@ def prepare_amp_config(train_cfg: dict) -> dict:
     keys = (
         "amp_reward_coef",
         "amp_motion_files",
+        "amp_motion_weights",
         "amp_task_reward_lerp",
         "amp_discr_hidden_dims",
         "amp_replay_buffer_size",
@@ -30,6 +31,7 @@ def prepare_amp_config(train_cfg: dict) -> dict:
         "amp_max_grad_norm",
         "amp_body_names",
         "amp_anchor_name",
+        "amp_root_name",
         "amp_all_body_names",
         "amp_frame_dt",
         "amp_observation_group",
